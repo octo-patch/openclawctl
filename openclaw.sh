@@ -709,6 +709,17 @@ for name, provider in list(providers.items()):
     for item in data['data']:
         if isinstance(item, dict) and item.get('id'):
             remote_ids.append(str(item['id']))
+    # Discovery is an ordinary catalog, not an instruction to reset saved IDs.
+    import re
+    def minimax_text(mid):
+        return bool(re.match(r'minimax-(?:m\d|text)', mid.rsplit('/', 1)[-1], re.I))
+    current = {'minimax-m3.1-flash', 'minimax-m3.1-flash:free', 'minimax-m3.1-flash-free', 'minimax-m3'}
+    direct_minimax = base_url.rstrip('/') in ('https://api.minimax.io/v1', 'https://api.minimaxi.com/v1')
+    minimax_provider = direct_minimax or any(minimax_text(mid) for mid in remote_ids) or any(
+        minimax_text(str(m.get('id', ''))) for m in model_list if isinstance(m, dict))
+    remote_ids = [mid for mid in remote_ids if not minimax_text(mid) or mid.rsplit('/', 1)[-1].lower() in current]
+    remote_ids += [str(m['id']) for m in model_list if isinstance(m, dict) and m.get('id')
+                   and minimax_provider and str(m['id']) not in remote_ids]
     remote_set = set(remote_ids)
 
     if not remote_set:
@@ -738,6 +749,12 @@ for name, provider in list(providers.items()):
         nm['id'] = mid
         if isinstance(nm.get('name'), str):
             nm['name'] = f'{name} / {mid}'
+        if direct_minimax and mid in ('MiniMax-M3.1-Flash', 'MiniMax-M3'):
+            # Do not inherit an unrelated template's limits or pricing.
+            nm.update(contextWindow=1000000, maxTokens=524288, input=['text', 'image', 'video'])
+            nm['cost'] = ({'input': 0.15, 'output': 0.60, 'cacheRead': 0.015, 'cacheWrite': None}
+                          if mid == 'MiniMax-M3.1-Flash' else
+                          {'input': 0.30, 'output': 1.20, 'cacheRead': 0.06, 'cacheWrite': None})
         new_models.append(nm)
 
     if not new_models:
@@ -762,7 +779,8 @@ for name, provider in list(providers.items()):
             changed = True
             summary.append(f'{fk} 已兜底替换: {val} -> {first_ref}')
 
-    stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(name + '/') and r not in expected_refs]
+    stale_refs = [r for r in list(defaults_models.keys()) if r.startswith(name + '/') and r not in expected_refs
+                  and not minimax_provider]
     for r in stale_refs:
         defaults_models.pop(r, None)
         changed = True
@@ -1373,6 +1391,21 @@ PY
 		break_end
 	}
 
+	# Filter ordinary choices only; saved model definitions remain in the config.
+	minimax_model_choices() {
+		python3 -c '
+import re, sys
+lines = sys.stdin.read().splitlines()
+def model_id(line):
+    return line.split()[0].rsplit("/", 1)[-1].lower() if line.strip() else ""
+def legacy(mid):
+    return bool(re.match(r"minimax-(?:m\d|text)", mid)) and mid not in ("minimax-m3.1-flash", "minimax-m3.1-flash:free", "minimax-m3.1-flash-free", "minimax-m3")
+lines = [line for line in lines if line.strip() and not legacy(model_id(line))]
+lines.sort(key=lambda line: 0 if model_id(line) in ("minimax-m3.1-flash", "minimax-m3.1-flash:free", "minimax-m3.1-flash-free") else 1)
+print("\n".join(lines))
+'
+	}
+
 	add-all-models-from-provider() {
 		local provider_name="$1"
 		local base_url="$2"
@@ -1408,6 +1441,8 @@ except Exception:
     pass
 ')
 
+		model_ids=$(printf '%s\n' "$model_ids" | minimax_model_choices)
+
 		if [[ -z "$model_ids" ]]; then
 			echo "错误：未找到任何模型"
 			return 1
@@ -1433,22 +1468,6 @@ except Exception:
 			local cache_write=0
 
 			case "$model_id" in
-				MiniMax-M3)
-					context_window=1000000
-					input_cost=0.6
-					output_cost=2.4
-					cache_read=0.12
-					cache_write="null"
-					input_modalities='["text", "image", "video"]'
-					;;
-				MiniMax-M2.7)
-					context_window=204800
-					input_cost=0.3
-					output_cost=1.2
-					cache_read=0.06
-					cache_write=0.375
-					input_modalities='["text"]'
-					;;
 				*opus*|*pro*|*preview*|*thinking*|*sonnet*)
 					input_cost=2.00
 					output_cost=12.00
@@ -1460,6 +1479,25 @@ except Exception:
 				*flash*|*lite*|*haiku*|*mini*|*nano*)
 					input_cost=0.10
 					output_cost=0.40
+					;;
+			esac
+
+			# Gateway metadata must follow that gateway's contract.
+			case "${base_url%/}" in
+				https://api.minimax.io/v1|https://api.minimaxi.com/v1)
+					case "$model_id" in
+						MiniMax-M3.1-Flash|MiniMax-M3)
+							context_window=1000000
+							max_tokens=524288
+							input_modalities='["text", "image", "video"]'
+							cache_write="null"
+							input_cost=0.15; output_cost=0.60; cache_read=0.015
+							if [[ "$model_id" == MiniMax-M3 ]]; then
+								# Standard tier up to 512k; longer prompts have tiered pricing.
+								input_cost=0.30; output_cost=1.20; cache_read=0.06
+							fi
+							;;
+					esac
 					;;
 			esac
 
@@ -1490,14 +1528,21 @@ EOF
 		   --arg key "$api_key" \
 		   --argjson models "$models_array" \
 		'
-		.models |= (
+		# A MiniMax-capable provider can also contain saved custom aliases.
+		(.models.providers[$prov].models // []) as $previous
+		| (if (any(($models + $previous)[]; .id | test("(?i)(^|/)minimax-(m[0-9]|text)")))
+		     or ($url | rtrimstr("/") | . == "https://api.minimax.io/v1" or . == "https://api.minimaxi.com/v1")
+		   then $previous else [] end) as $saved
+		| (($models | map(. as $m | ($saved | map(select(.id == $m.id)) | first) // $m))
+		  + ($saved | map(. as $m | select(all($models[]; .id != $m.id))))) as $merged
+		| .models |= (
 			(. // { mode: "merge", providers: {} })
 			| .mode = "merge"
 			| .providers[$prov] = {
 				baseUrl: $url,
 				apiKey: $key,
 				api: "openai-completions",
-				models: $models
+				models: $merged
 			}
 		)
 		| .agents |= (. // {})
@@ -1568,6 +1613,7 @@ try:
 except Exception:
     pass
 ')
+			available_models=$(printf '%s\n' "$available_models" | minimax_model_choices)
 			model_count=$(echo "$available_models" | wc -l | tr -d ' ')
 		fi
 
@@ -2094,7 +2140,7 @@ PY
 
 	change_model() {
 		local all_models model
-		all_models=$(openclaw models list --all 2>/dev/null | grep "configured")
+		all_models=$(openclaw models list --all 2>/dev/null | grep "configured" | minimax_model_choices)
 
 		if [[ -z "$all_models" ]]; then
 			ui_err "无法获取可用模型列表（请先添加 API 提供商）"

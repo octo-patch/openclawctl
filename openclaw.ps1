@@ -679,23 +679,45 @@ function Get-ModelCost {
     return @{ input = $input; output = $output; cacheRead = 0; cacheWrite = 0 }
 }
 
-function Get-ModelMetadata {
+function Test-DirectMiniMax {
+    param([string]$BaseUrl)
+    return $BaseUrl.TrimEnd('/') -cin @('https://api.minimax.io/v1', 'https://api.minimaxi.com/v1')
+}
+
+function Test-MiniMaxText {
     param([string]$ModelId)
+    return ($ModelId -split '/')[-1] -match '^minimax-(m\d|text)'
+}
+
+function Select-ModelChoices {
+    param([string[]]$ModelIds)
+    $current = @('minimax-m3.1-flash', 'minimax-m3.1-flash:free', 'minimax-m3.1-flash-free', 'minimax-m3')
+    $choices = @($ModelIds | Where-Object {
+        $_ -and ((-not (Test-MiniMaxText $_)) -or ($current -contains ($_ -split '/')[-1]))
+    })
+    # Preserve discovery order except for putting Flash first.
+    $flash = @($choices | Where-Object { ($_ -split '/')[-1] -match '^minimax-m3\.1-flash(:free|-free)?$' })
+    $rest = @($choices | Where-Object { ($_ -split '/')[-1] -notmatch '^minimax-m3\.1-flash(:free|-free)?$' })
+    return @($flash) + @($rest)
+}
+
+function Get-ModelMetadata {
+    param([string]$ModelId, [string]$BaseUrl)
     $meta = @{
         contextWindow = 1048576
+        maxTokens     = 128000
         input         = @('text', 'image')
         cost          = Get-ModelCost $ModelId
     }
-    switch -Regex ($ModelId) {
-        '^MiniMax-M3$' {
-            $meta.contextWindow = 1000000
-            $meta.input = @('text', 'image', 'video')
-            $meta.cost = @{ input = 0.6; output = 2.4; cacheRead = 0.12; cacheWrite = $null }
-        }
-        '^MiniMax-M2\.7$' {
-            $meta.contextWindow = 204800
-            $meta.input = @('text')
-            $meta.cost = @{ input = 0.3; output = 1.2; cacheRead = 0.06; cacheWrite = 0.375 }
+    # Gateway metadata must follow that gateway's contract.
+    if ((Test-DirectMiniMax $BaseUrl) -and $ModelId -cin @('MiniMax-M3.1-Flash', 'MiniMax-M3')) {
+        $meta.contextWindow = 1000000
+        $meta.maxTokens = 524288
+        $meta.input = @('text', 'image', 'video')
+        $meta.cost = @{ input = 0.15; output = 0.60; cacheRead = 0.015; cacheWrite = $null }
+        if ($ModelId -ceq 'MiniMax-M3') {
+            # Standard tier up to 512k; longer prompts have tiered pricing.
+            $meta.cost = @{ input = 0.30; output = 1.20; cacheRead = 0.06; cacheWrite = $null }
         }
     }
     return $meta
@@ -716,19 +738,25 @@ function Add-ModelsFromProvider {
         return $false
     }
 
+    $json = Get-Content $script:OpenClawJson -Raw | ConvertFrom-Json
+    $previous = @($json.models.providers.$Name.models | Where-Object { $_.id })
+    $minimaxProvider = (Test-DirectMiniMax $BaseUrl) -or @(@($models) + $previous | Where-Object { Test-MiniMaxText $_.id }).Count -gt 0
+    $saved = if ($minimaxProvider) { $previous } else { @() }
     $modelArray = @()
-    foreach ($m in $models) {
-        if (-not $m.id) { continue }
-        $meta = Get-ModelMetadata $m.id
+    foreach ($id in (Select-ModelChoices @($models | ForEach-Object { $_.id }))) {
+        $existing = @($saved | Where-Object { $_.id -ceq $id })
+        if ($existing.Count -gt 0) { $modelArray += $existing[0]; continue }
+        $meta = Get-ModelMetadata $id $BaseUrl
         $modelArray += @{
-            id            = $m.id
-            name          = "$Name / $($m.id)"
+            id            = $id
+            name          = "$Name / $id"
             input         = $meta.input
             contextWindow = $meta.contextWindow
-            maxTokens     = 128000
+            maxTokens     = $meta.maxTokens
             cost          = $meta.cost
         }
     }
+    $modelArray += @($saved | Where-Object { $modelArray.id -cnotcontains $_.id })
 
     if ($modelArray.Count -eq 0) {
         UI-Err "无可用模型"
@@ -793,6 +821,7 @@ function Change-Model {
         }
     }
 
+    $modelNames = @(Select-ModelChoices $modelNames)
     if ($modelNames.Count -eq 0) { UI-Err "无可用模型"; Press-Enter; return }
 
     Ensure-Fzf
@@ -1253,6 +1282,12 @@ function Sync-OpenClawAPIModels {
             continue
         }
 
+        $minimaxProvider = (Test-DirectMiniMax $pval.baseUrl) -or @($remoteIds + @($pval.models.id) | Where-Object { Test-MiniMaxText $_ }).Count -gt 0
+        $remoteIds = @(Select-ModelChoices $remoteIds)
+        # Keep saved definitions and custom aliases on MiniMax-capable providers.
+        $remoteIds += @($pval.models | Where-Object {
+            $_.id -and $minimaxProvider -and $remoteIds -cnotcontains $_.id
+        } | ForEach-Object { [string]$_.id })
         $remoteSet = [System.Collections.Generic.HashSet[string]]::new()
         foreach ($rid in $remoteIds) { $remoteSet.Add($rid) | Out-Null }
 
@@ -1274,6 +1309,12 @@ function Sync-OpenClawAPIModels {
                 $nm = $template.PSObject.Copy()
                 $nm.id = $rid
                 if ($nm.name) { $nm.name = "$pname / $rid" }
+                if ((Test-DirectMiniMax $pval.baseUrl) -and $rid -cin @('MiniMax-M3.1-Flash', 'MiniMax-M3')) {
+                    $meta = Get-ModelMetadata $rid $pval.baseUrl
+                    foreach ($key in $meta.Keys) {
+                        $nm | Add-Member -NotePropertyName $key -NotePropertyValue $meta[$key] -Force
+                    }
+                }
                 $newModels.Add($nm) | Out-Null
                 $addedCount++
             }
@@ -1287,7 +1328,8 @@ function Sync-OpenClawAPIModels {
             $newRefs = $newModels | ForEach-Object { "$pname/$($_.id)" }
             if ($json.agents.defaults.models) {
                 foreach ($mp in @($json.agents.defaults.models.PSObject.Properties)) {
-                    if ($mp.Name.StartsWith("$pname/") -and $newRefs -notcontains $mp.Name) {
+                    if ($mp.Name.StartsWith("$pname/") -and $newRefs -notcontains $mp.Name -and
+                        -not $minimaxProvider) {
                         $json.agents.defaults.models.PSObject.Properties.Remove($mp.Name)
                     }
                 }
